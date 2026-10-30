@@ -1,0 +1,35 @@
+INVOICE
+AnyCompany Wholesales
+DATE
+Aug 21, 2018
+Suite 755 586 Herb Springs
+INVOICE #
+89842426-k
+West Floydton VT 15677
+CUSTOMER ID
+140
+Phone: (858)-555-0101
+DUE DATE Sep 05, 2018
+Bill To:
+Mateo Jackson
+96957 Balistreri Haven, West Elihaven
+Virginia 49391-3235
+MateoJackson@example.com
+Description
+Amount
+NFL New Orleans Saints Silicone
+$17.9
+VR Headset Glasses Virtual Reality
+$29.69
+JOCO Glass Reusable 12oz Coffee
+$42.31
+Total:
+$89.90
+Other Comments:
+Total Payment due in 30 days
+If paying by check, please include the invoice number
+in the check
+If you have any questions about this invoice, please contact us at
+Phone: (858)-555-0101
+Email: bice_inquiry@example.com
+Thank You For Your Business!!
