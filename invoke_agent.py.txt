@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Helper script to invoke the AgentCore Runtime finance agent."""
+
+import argparse
+import json
+import sys
+import uuid
+
+import boto3
+
+
+def get_agent_runtime_arn():
+    """Retrieve the agent runtime ARN from SSM Parameters."""
+    ssm = boto3.client("ssm")
+    response = ssm.get_parameter(Name="/agentcore-lab/agent-runtime-arn")
+    return response["Parameter"]["Value"]
+
+
+def invoke_agent(query, session_id=None):
+    """Invoke the AgentCore Runtime agent with the given query."""
+    agent_arn = get_agent_runtime_arn()
+
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+
+    client = boto3.client("bedrock-agentcore")
+
+    print(f"\nInvoking agent with session: {session_id}")
+    print(f"Query: {query}\n")
+    print("-" * 60)
+
+    try:
+        payload = json.dumps({"prompt": query}).encode()
+
+        response = client.invoke_agent_runtime(
+            agentRuntimeArn=agent_arn,
+            runtimeSessionId=session_id,
+            payload=payload,
+        )
+
+        content_type = response.get("contentType", "")
+        if "text/event-stream" in content_type:
+            content = []
+            for line in response["response"].iter_lines(chunk_size=10):
+                if line:
+                    line = line.decode("utf-8")
+                    if line.startswith("data: "):
+                        chunk = line[6:]
+                        try:
+                            chunk = json.loads(chunk)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                        if isinstance(chunk, str):
+                            print(chunk, end="", flush=True)
+                            content.append(chunk)
+            result = "".join(content)
+        elif content_type == "application/json":
+            chunks = []
+            for chunk in response.get("response", []):
+                chunks.append(chunk.decode("utf-8"))
+            result = "".join(chunks)
+            print(result)
+        else:
+            result = str(response)
+            print(result)
+
+        print(f"\n{'=' * 60}")
+        print(f"Session ID: {session_id}")
+        return result
+
+    except Exception as e:
+        print(f"\nError invoking agent: {e}")
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Invoke the AgentCore finance agent")
+    parser.add_argument("query", nargs="?", help="The query to send to the agent")
+    parser.add_argument("--session-id", help="Session ID for conversation continuity")
+    parser.add_argument(
+        "--interactive", "-i", action="store_true", help="Run in interactive mode"
+    )
+    args = parser.parse_args()
+
+    if args.interactive:
+        session_id = str(uuid.uuid4())
+        print("Interactive mode - type 'exit' to quit")
+        print(f"Session: {session_id}\n")
+        while True:
+            try:
+                query = input("You: ")
+                if query.lower() in ("exit", "quit"):
+                    break
+                invoke_agent(query, session_id)
+            except KeyboardInterrupt:
+                break
+    elif args.query:
+        invoke_agent(args.query, args.session_id)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

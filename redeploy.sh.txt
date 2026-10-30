@@ -1,0 +1,105 @@
+#!/bin/bash
+# Redeploy the agent to AgentCore Runtime after code changes.
+#
+# The AgentCore CLI project was scaffolded during lab provisioning at
+# ~/environment/FinanceAgent (via `agentcore create`). You edit the agent in
+# ~/environment/main.py; this script syncs that file into the project's app
+# directory and redeploys with the AgentCore CLI (CDK-based).
+
+set -e
+
+# The IDE has no internet access after setup. The agent is packaged as a
+# CodeZip, which runs uv locally to install its dependencies; lab setup filled
+# the uv cache, so resolve from it instead of reaching PyPI.
+export UV_OFFLINE=1
+
+AGENT_NAME="FinanceAgent"
+HOME_FOLDER="$HOME/environment"
+
+echo "Redeploying agent to AgentCore Runtime..."
+echo "  Agent: $AGENT_NAME"
+
+# Locate the generated AgentCore CLI project + app directory.
+AGENTCORE_JSON=$(find "$HOME_FOLDER" -maxdepth 4 -path '*/agentcore/agentcore.json' | head -1)
+if [ -z "$AGENTCORE_JSON" ]; then
+    echo "ERROR: Could not find the AgentCore project (agentcore/agentcore.json) under $HOME_FOLDER"
+    exit 1
+fi
+PROJECT_DIR=$(dirname "$(dirname "$AGENTCORE_JSON")")
+APP_MAIN=$(find "$PROJECT_DIR/app" -maxdepth 2 -name main.py | head -1)
+APP_DIR=$(dirname "$APP_MAIN")
+
+echo "  Project: $PROJECT_DIR"
+
+# Sync the edited agent code into the project's app directory.
+echo "Syncing source files..."
+cp "$HOME_FOLDER/main.py" "$APP_DIR/main.py"
+
+# Ensure the pre-created runtime execution role stays pinned so the deploy does
+# not try to create a new IAM role (the scoped CDK policy forbids iam:CreateRole).
+CURRENT_ROLE=$(jq -r '.runtimes[0].executionRoleArn // empty' "$AGENTCORE_JSON")
+if [ -z "$CURRENT_ROLE" ]; then
+    echo "executionRoleArn not set; pinning the pre-created runtime execution role..."
+    ROLE_ARN=$(aws iam list-roles \
+      --query "Roles[?starts_with(RoleName, 'AmazonBedrockAgentCoreRuntimeRole-')].Arn | [0]" \
+      --output text 2>/dev/null)
+    if [ -z "$ROLE_ARN" ] || [ "$ROLE_ARN" = "None" ]; then
+        echo "ERROR: executionRoleArn is not set and the pre-created role could not be found."
+        echo "  Deploy would fail trying to create an IAM role. Aborting."
+        exit 1
+    fi
+    jq --arg arn "$ROLE_ARN" '.runtimes[0].executionRoleArn = $arn' \
+      "$AGENTCORE_JSON" > "${AGENTCORE_JSON}.tmp" && mv "${AGENTCORE_JSON}.tmp" "$AGENTCORE_JSON"
+    echo "  Pinned executionRoleArn = $ROLE_ARN"
+else
+    echo "executionRoleArn already pinned: $CURRENT_ROLE"
+fi
+
+echo "Deploying (this repackages the agent code and updates the runtime)..."
+cd "$PROJECT_DIR"
+agentcore deploy -y
+
+# Wait for a resolved runtime ARN (agentcore status reports .../runtime/pending
+# briefly right after a deploy) before updating SSM.
+RUNTIME_ARN=""
+for attempt in $(seq 1 16); do
+    RUNTIME_ARN=$(agentcore status --json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+def walk(o):
+    if isinstance(o, dict):
+        for v in o.values():
+            if isinstance(v, str) and ':runtime/' in v and v.startswith('arn:') and 'pending' not in v:
+                print(v); return True
+            if walk(v): return True
+    elif isinstance(o, list):
+        for it in o:
+            if walk(it): return True
+    return False
+walk(data)
+" 2>/dev/null | head -1 || echo "")
+    if [ -n "$RUNTIME_ARN" ]; then
+        break
+    fi
+    echo "  Runtime ARN not resolved yet (attempt ${attempt}/16); waiting 15s..."
+    sleep 15
+done
+
+if [ -n "$RUNTIME_ARN" ]; then
+    aws ssm put-parameter \
+        --name "/agentcore-lab/agent-runtime-arn" \
+        --value "$RUNTIME_ARN" \
+        --type "String" \
+        --overwrite
+    echo ""
+    echo "Redeployment complete!"
+    echo "  Agent ARN: $RUNTIME_ARN"
+    echo "  SSM parameter updated"
+else
+    echo ""
+    echo "Redeployment complete!"
+    echo "  SSM parameter unchanged (could not retrieve ARN from status)"
+fi

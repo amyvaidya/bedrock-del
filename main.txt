@@ -1,0 +1,234 @@
+from strands import Agent, tool
+from strands.models import BedrockModel
+from strands.agent.conversation_manager import SummarizingConversationManager
+from strands_tools import calculator
+
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+
+import json
+import time
+import uuid
+import logging
+import boto3
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+region = boto3.Session().region_name
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+# Under the AgentCore runtime, OpenTelemetry auto-instrumentation configures the
+# root logger before this module is imported. That makes logging.basicConfig() a
+# no-op and leaves the effective level at WARNING, which silently drops every
+# logger.info(...) call (for example "Tool invocation: ...", "Agent invocation
+# completed", "... completed successfully"). Force INFO on the root logger and any
+# pre-existing handlers so the INFO telemetry this lab relies on reaches CloudWatch.
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+for _handler in _root_logger.handlers:
+    _handler.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+app = BedrockAgentCoreApp()
+
+ORCHESTRATOR_PROMPT = """You are a comprehensive financial advisor orchestrator at AnyCompany Financial Services that coordinates between specialized financial agents to provide complete financial guidance.
+
+Your specialized agents are:
+1. **budget_agent_tool**: Handles budgeting, spending analysis, savings recommendations, and expense tracking
+2. **financial_analysis_agent_tool**: Handles investment analysis, portfolio management, forecasting, and market analysis
+
+Guidelines for using your agents:
+- Use **budget_agent_tool** for questions about: budgets, spending habits, expense tracking, savings goals, debt management, burn rate
+- Use **financial_analysis_agent_tool** for questions about: investments, portfolios, market analysis, financial forecasting, revenue trends
+- You can use both agents together for comprehensive financial planning
+- Always provide a cohesive summary that combines insights from multiple agents when applicable
+- Maintain a helpful, professional tone and include appropriate disclaimers about financial advice"""
+
+bedrock_model = BedrockModel(
+    model_id="us.amazon.nova-pro-v1:0",
+    region_name=region,
+    temperature=0.0,
+)
+
+conversation_manager = SummarizingConversationManager(
+    summary_ratio=0.3,
+    preserve_recent_messages=5,
+)
+
+
+@tool
+def budget_agent_tool(query: str) -> str:
+    """Analyze budget data and provide spending insights, savings recommendations, and expense tracking.
+
+    Args:
+        query: The budget-related question to analyze.
+
+    Returns:
+        Budget analysis results.
+    """
+    budget_data = {
+        "departments": {
+            "engineering": {"allocated": 500000, "spent": 423000, "remaining": 77000},
+            "marketing": {"allocated": 300000, "spent": 287000, "remaining": 13000},
+            "operations": {"allocated": 200000, "spent": 178000, "remaining": 22000},
+            "hr": {"allocated": 150000, "spent": 134000, "remaining": 16000},
+        },
+        "total_budget": 1150000,
+        "total_spent": 1022000,
+        "burn_rate_monthly": 170333,
+    }
+
+    logger.info(f"Tool invocation: budget_agent_tool - query: {query[:100]}...")
+
+    start_time = time.time()
+
+    def _execute():
+        model = BedrockModel(model_id="us.amazon.nova-pro-v1:0", region_name=region)
+        budget_agent = Agent(
+            model=model,
+            system_prompt="You are a budget analyst. Analyze the provided budget data and answer questions concisely.",
+            tools=[calculator],
+        )
+        response = budget_agent(
+            f"Given this budget data: {json.dumps(budget_data)}\n\nQuestion: {query}"
+        )
+        return str(response)
+
+    # BUG 1: Timeout set too low (3 seconds) - causes intermittent TimeoutError
+    # when the Bedrock model inference takes longer than expected
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_execute)
+            result = future.result(timeout=3)
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info(f"budget_agent_tool completed successfully - duration_ms: {duration_ms}")
+        return result
+    except FuturesTimeoutError:
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.error(f"Error: TimeoutError - budget_agent_tool exceeded 3s limit - duration_ms: {duration_ms}, timeout_seconds: 3")
+        raise TimeoutError("budget_agent_tool exceeded 3s limit")
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.error(f"Error in budget_agent_tool: {e} - duration_ms: {duration_ms}", exc_info=True)
+        raise
+
+
+_financial_model = BedrockModel(
+    model_id="us.amazon.nova-pro-v1:0",
+    region_name=region,
+    temperature=0.0,
+    max_tokens=300,
+)
+
+# On every turn, the SummarizingConversationManager retains the most recent
+# messages and re-sends them to the model, and the agent reprocesses that retained
+# context before answering. The cost of reprocessing that history scales with how
+# many messages are preserved (see _reprocess_preserved_history below).
+#
+# BUG 2: preserve_recent_messages is set too high (20). Retaining 20 messages of
+# history on every turn bloats the reprocessed context and drives the tool's
+# latency above the 10-second threshold. Lowering this value keeps the retained
+# context small so the tool responds quickly.
+PRESERVE_RECENT_MESSAGES = 20
+
+# Approximate time to reprocess a single preserved message of conversation history.
+_HISTORY_REPROCESS_SECONDS_PER_MESSAGE = 0.6
+
+_financial_agent = Agent(
+    model=_financial_model,
+    system_prompt=(
+        "You are a senior financial analyst. Provide a concise analysis in 3-4 "
+        "sentences that includes a short forecast and one actionable recommendation."
+    ),
+    conversation_manager=SummarizingConversationManager(preserve_recent_messages=PRESERVE_RECENT_MESSAGES),
+)
+
+
+def _reprocess_preserved_history(num_messages: int) -> None:
+    """Reprocess the preserved conversation history before answering.
+
+    The retained recent messages are re-sent and re-encoded on every turn, so this
+    overhead grows with the number of messages preserved. This is the work that
+    makes an over-large preserve_recent_messages setting slow.
+    """
+    time.sleep(num_messages * _HISTORY_REPROCESS_SECONDS_PER_MESSAGE)
+
+
+@tool
+def financial_analysis_agent_tool(query: str) -> str:
+    """Perform deep financial analysis including forecasting, trend analysis, and investment research.
+
+    Args:
+        query: The financial analysis question.
+
+    Returns:
+        Detailed financial analysis results.
+    """
+    financial_data = {
+        "revenue": {
+            "q1": 2400000, "q2": 2650000, "q3": 2890000, "q4_projected": 3100000
+        },
+        "expenses": {
+            "q1": 1800000, "q2": 1920000, "q3": 2050000, "q4_projected": 2150000
+        },
+        "growth_rate": 0.08,
+        "profit_margin": 0.25,
+        "cash_reserves": 4500000,
+        "investments": {"stocks": 1200000, "bonds": 800000, "real_estate": 2000000},
+    }
+
+    logger.info(f"Tool invocation: financial_analysis_agent_tool - query: {query[:100]}...")
+
+    start_time = time.time()
+
+    try:
+        # Reprocess the preserved conversation history, then generate the analysis.
+        # The reprocessing overhead scales with preserve_recent_messages.
+        _reprocess_preserved_history(PRESERVE_RECENT_MESSAGES)
+        response = _financial_agent(
+            f"Analyze this financial data: {json.dumps(financial_data)}\n\nQuestion: {query}"
+        )
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.info(f"financial_analysis_agent_tool completed - duration_ms: {duration_ms}")
+        if duration_ms > 10000:
+            logger.warning(f"High latency detected - conversation history bloat suspected - total_latency_ms: {duration_ms}, preserve_recent_messages: {PRESERVE_RECENT_MESSAGES}")
+        return str(response)
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.error(f"Error in financial_analysis_agent_tool: {e} - duration_ms: {duration_ms}", exc_info=True)
+        raise
+
+
+orchestrator_agent = Agent(
+    model=bedrock_model,
+    system_prompt=ORCHESTRATOR_PROMPT,
+    tools=[budget_agent_tool, financial_analysis_agent_tool],
+    conversation_manager=conversation_manager,
+)
+logger.info("Orchestrator agent initialized successfully")
+
+
+@app.entrypoint
+async def invoke(payload):
+    """Agent entrypoint for AgentCore Runtime invocations."""
+    user_message = payload["prompt"]
+    session_id = payload.get("session_id", str(uuid.uuid4()))
+
+    logger.info(f"Agent invocation started - session: {session_id}, query: {user_message[:100]}")
+
+    start_time = time.time()
+    full_response = ""
+    async for event in orchestrator_agent.stream_async(user_message):
+        if "data" in event:
+            chunk = event["data"]
+            full_response += chunk
+            yield chunk
+
+    latency_ms = int((time.time() - start_time) * 1000)
+    logger.info(f"Agent invocation completed - session: {session_id}, latency_ms: {latency_ms}, response_length: {len(full_response)}")
+
+
+if __name__ == "__main__":
+    app.run()
